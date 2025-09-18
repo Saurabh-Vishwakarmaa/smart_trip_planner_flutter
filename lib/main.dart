@@ -1,22 +1,25 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:smart_trip_planner_flutter/authpages/loginpage.dart';
-import 'package:smart_trip_planner_flutter/authpages/signuppage.dart';
 import 'package:smart_trip_planner_flutter/presentations/screens/echo_screen.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const ProviderScope(child: MyApp()));
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-
-      home: AgentScreen(),
+      debugShowCheckedModeBanner: false,
+      title: 'Smart Trip Planner',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF10B981)),
+        useMaterial3: true,
+      ),
+      home: const AgentScreen(),
     );
   }
 }
