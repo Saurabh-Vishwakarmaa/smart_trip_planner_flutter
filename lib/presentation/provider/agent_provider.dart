@@ -32,6 +32,13 @@ class AgentNotifier extends StateNotifier<AsyncValue<AgentResult>> {
       await for (final raw in response) {
         final msg = Map<String, dynamic>.from(raw as Map);
         switch (msg['type']) {
+          case 'delta':
+            state = AsyncValue.data(AgentResult(
+              itinerary: Map<String, dynamic>.from(msg['data'] as Map),
+              tokens: state.hasValue ? state.value!.tokens : const {},
+              aux: Map<String, dynamic>.from((msg['aux'] as Map?) ?? const {}),
+            ));
+            break;
           case 'done':
             state = AsyncValue.data(AgentResult(
               itinerary: Map<String, dynamic>.from(msg['data'] as Map),

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:smart_trip_planner_flutter/presentations/screens/echo_screen.dart';
 
 void main() {
@@ -12,12 +13,18 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final base = ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFF10B981));
     return MaterialApp(
-      debugShowCheckedModeBanner: false,
       title: 'Smart Trip Planner',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF10B981)),
-        useMaterial3: true,
+      theme: base.copyWith(
+        textTheme: GoogleFonts.interTextTheme(base.textTheme),
+        appBarTheme: base.appBarTheme.copyWith(
+          titleTextStyle: GoogleFonts.inter(textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: Colors.black)),
+          backgroundColor: Colors.white,
+          foregroundColor: Colors.black,
+          elevation: 0,
+        ),
+        scaffoldBackgroundColor: const Color(0xFFF8F8F8),
       ),
       home: const AgentScreen(),
     );

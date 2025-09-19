@@ -7,6 +7,36 @@ import 'package:http/http.dart' as http;
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:smart_trip_planner_flutter/constants.dart';
 
+// In-memory caches to minimize API hits
+final _geocodeCache = <String, Map<String, double>?>{};
+final _poiCache = <String, Map<String, dynamic>?>{};
+
+// Budget classifier
+enum _Budget { low, mid, high }
+
+_Budget _inferBudget(String text) {
+  final t = text.toLowerCase();
+  if (RegExp(r'\b(low|budget|cheap|economy|student)\b').hasMatch(t)) return _Budget.low;
+  if (RegExp(r'\b(luxury|5-?star|upscale|premium|expensive)\b').hasMatch(t)) return _Budget.high;
+  return _Budget.mid;
+}
+
+double _scorePlace(Map<String, dynamic> r, _Budget b) {
+  final rating = (r['rating'] as num?)?.toDouble() ?? 0;
+  final count = (r['user_ratings_total'] as num?)?.toDouble() ?? 0;
+  final price = (r['price_level'] as num?)?.toDouble() ?? 2; // 0..4
+  final wp = switch (b) { _Budget.low => 0.9, _Budget.mid => 0.3, _Budget.high => -0.2 };
+  return (rating * 2.0) + (count > 0 ? (math.log(1 + count) * 0.7) : 0) - (wp * price);
+}
+
+String _priceSymbol(int? level) {
+  if (level == null) return '';
+  return List.filled(level + 1, r'$').join();
+}
+
+// Optional: disable Wikipedia to reduce calls
+const bool kEnableWikiSnippet = false;
+
 void agentWorker(SendPort sendPort) async {
   final port = ReceivePort();
   sendPort.send(port.sendPort);
@@ -26,11 +56,10 @@ void agentWorker(SendPort sendPort) async {
         continue;
       }
 
-      // 1) Get skeleton (non-streaming JSON)
       final model = GenerativeModel(
         model: 'gemini-1.5-flash-latest',
         apiKey: geminiKey,
-        generationConfig:  GenerationConfig(responseMimeType: 'application/json'),
+        generationConfig: GenerationConfig(responseMimeType: 'application/json'),
       );
       final instruction = _promptInstruction(prompt, prevJson, chatHistoryJson);
       final resp = await model.generateContent([Content.text(instruction)]);
@@ -45,10 +74,8 @@ void agentWorker(SendPort sendPort) async {
         continue;
       }
 
-      // 2) Ensure start..end coverage
       skeleton = _ensureContinuousDays(skeleton);
 
-      // 3) Destination center (bounds)
       final destName = (skeleton['destination']?.toString() ?? '').trim();
       if (destName.isEmpty) {
         reply.send({"type": "error", "ok": false, "data": "destination missing"});
@@ -60,16 +87,21 @@ void agentWorker(SendPort sendPort) async {
         continue;
       }
 
-      // 4) Enrich: geocode, restaurant ratings, map links, snippets
-      final placesKey = const String.fromEnvironment('GOOGLE_PLACES_API_KEY', defaultValue: '');
+      final placesKey = Secrets.places_api_key;
       final enrichment = await _enrichSkeleton(
         skeleton,
         destCenter: destCenter,
         radiusMeters: 25000,
         placesKey: placesKey.isNotEmpty ? placesKey : null,
+        onDelta: (partial, aux) {
+          // Stream incremental results
+          try {
+            reply.send({"type": "delta", "ok": true, "data": partial, "aux": aux});
+          } catch (_) {}
+        },
+        budget: _inferBudget('$prompt ${skeleton['title'] ?? ''}'),
       );
 
-      // 5) Validate Spec A strictly (human-readable locations only)
       final err = _validateSpecA(enrichment.itinerary);
       if (err != null) {
         reply.send({"type": "error", "ok": false, "data": "Schema error: $err"});
@@ -79,8 +111,8 @@ void agentWorker(SendPort sendPort) async {
       reply.send({
         "type": "done",
         "ok": true,
-        "data": enrichment.itinerary, // Spec A only
-        "aux": enrichment.aux,        // coords, rating, mapLink, duration, distance, snippet
+        "data": enrichment.itinerary,
+        "aux": enrichment.aux,
         "tokens": {
           "prompt": resp.usageMetadata?.promptTokenCount ?? 0,
           "completion": resp.usageMetadata?.candidatesTokenCount ?? 0,
@@ -94,11 +126,114 @@ void agentWorker(SendPort sendPort) async {
   }
 }
 
-String _promptInstruction(String prompt, String? prevJson, String? chatHistoryJson) => '''
-You are a professional travel planner.
+// >>> NEW: time rules for well-known activities (Varanasi examples)
+final _timeRules = <_TimeRule>[
+  _TimeRule(
+    where: (dest, text) => _containsAny(dest, ['varanasi', 'kashi', 'banaras']) &&
+                           _containsAny(text, ['ganga aarti', 'ganga arti', 'aarti', 'arti', 'dashashwamedh', 'assi ghat']),
+    prefer: ['19:00', '06:00'], // evening default, morning alt
+  ),
+  _TimeRule(
+    where: (dest, text) => _containsAny(dest, ['varanasi', 'kashi', 'banaras']) &&
+                           _containsAny(text, ['sunrise boat', 'morning boat', 'boat ride', 'subah-e-banaras']),
+    prefer: ['05:30'],
+  ),
+  _TimeRule(
+    where: (dest, text) => _containsAny(dest, ['varanasi', 'kashi']) &&
+                           _containsAny(text, ['sarnath']),
+    prefer: ['11:00', '15:00'],
+  ),
+];
 
-Output ONLY JSON (no markdown). Return an itinerary SKELETON that tools will enrich.
-Schema:
+class _TimeRule {
+  final bool Function(String destination, String text) where;
+  final List<String> prefer;
+  const _TimeRule({required this.where, required this.prefer});
+}
+
+bool _containsAny(String s, List<String> kws) {
+  final t = s.toLowerCase();
+  return kws.any((k) => t.contains(k.toLowerCase()));
+}
+
+void _nudgeTimesForKnownActivities(String destination, List<Map<String, dynamic>> items) {
+  for (final it in items) {
+    final label = [
+      it['activity']?.toString() ?? '',
+      it['place']?.toString() ?? '',
+      it['search']?.toString() ?? '',
+      it['location']?.toString() ?? '',
+    ].where((e) => e.isNotEmpty).join(' ');
+    for (final r in _timeRules) {
+      if (r.where(destination, label)) {
+        // If time not set or not in a sane window for this activity, set preferred
+        final old = it['time']?.toString() ?? '';
+        if (old.isEmpty || !_timeLooksSaneFor(r.prefer, old)) {
+          it['time'] = r.prefer.first;
+        }
+        break;
+      }
+    }
+  }
+}
+
+bool _timeLooksSaneFor(List<String> prefer, String current) {
+  int hour(String t) => int.tryParse(t.split(':').first) ?? -1;
+  final h = hour(current);
+  if (h < 0) return false;
+  // If any preferred hour window matches roughly, accept
+  for (final p in prefer) {
+    final hp = hour(p);
+    if ((h - hp).abs() <= 1) return true;
+  }
+  return false;
+}
+
+String _lodgingSearchHint(String destination, _Budget budget) {
+  final low = budget == _Budget.low;
+  if (_containsAny(destination, ['varanasi', 'kashi', 'banaras'])) {
+    return low
+        ? 'affordable budget hotels and guest houses near Dashashwamedh Ghat or Assi Ghat, Varanasi'
+        : 'best hotels near Dashashwamedh Ghat or Assi Ghat, Varanasi';
+  }
+  return low ? 'affordable budget hotels in $destination' : 'best hotels in $destination';
+}
+
+void _ensureArrivalAndStayOnDay0(String destination, _Budget budget, List<Map<String, dynamic>> items) {
+  bool hasArrival = items.any((it) => _containsAny((it['activity'] ?? '').toString(), ['arrive', 'arrival', 'airport', 'transfer']));
+  bool hasStay = items.any((it) {
+    final a = (it['activity'] ?? '').toString().toLowerCase();
+    final p = (it['place'] ?? '').toString().toLowerCase();
+    final s = (it['search'] ?? '').toString().toLowerCase();
+    return a.contains('hotel') || a.contains('check-in') || a.contains('check in') || a.contains('stay') ||
+           p.contains('hotel') || s.contains('hotel') || p.contains('resort') || a.contains('accommodation');
+  });
+
+  // Insert Arrival (first item)
+  if (!hasArrival) {
+    items.insert(0, {
+      'time': '09:00',
+      'activity': 'Arrival',
+      'place': '$destination Airport', // helps resolve a real POI
+    });
+  }
+
+  // Insert Accommodation right after Arrival
+  if (!hasStay) {
+    final idx = items.length > 1 ? 1 : 0;
+    items.insert(idx, {
+      'time': '12:00',
+      'activity': 'Accommodation: Check-in',
+      'search': _lodgingSearchHint(destination, budget), // web search for stay
+    });
+  }
+}
+
+// >>> UPDATED: prompt — time-aware + arrival/stay + refine-in-place when prevJson present
+String _promptInstruction(String prompt, String? prevJson, String? chatHistoryJson) {
+  final base = '''
+You are a professional travel planner. Return ONLY JSON (no markdown) that follows Spec A:
+
 {
   "destination": "City, Country",
   "title": "string",
@@ -110,23 +245,44 @@ Schema:
       "summary": "string",
       "items": [
         { "time": "HH:mm", "activity": "string", "place": "Named attraction/POI" },
-        { "time": "HH:mm", "activity": "Lunch", "search": "best restaurants near <area>" },
-        { "time": "HH:mm", "activity": "Travel", "route": { "from": "City or landmark", "to": "City or landmark" } }
+        { "time": "HH:mm", "activity": "Lunch", "search": "best restaurants near <area>" }
       ]
     }
   ]
 }
 
-Requirements:
-- days MUST cover EVERY date from startDate..endDate inclusive.
-- 3–5 items/day with realistic times (morning ~09:00, lunch ~13:00, afternoon ~15:00, evening ~18:30).
-- Include at least one meal (Lunch/Dinner) most days using "search".
-- Use known place names in the destination.
+Rules:
+- Use specific, known place names (avoid generic "hotel near ...").
+- Day 1 MUST start with Arrival in <destination> and an Accommodation/Check-in item.
+- last day should have the departure and when as after whole schedule
+-times should be in sync one after another (e.g., 7 then 8 then 9 flow should be like this not random)
+- Times must be realistic and respect local schedules (e.g., in Varanasi: Ganga Aarti ~19:00–20:00 evening and ~06:00 morning; sunrise boat rides ~05:30).
+- 3–5 items/day with morning/lunch/afternoon/evening cadence.
+- DO NOT include route/travel items.
+''';
 
-User prompt: $prompt
+  final refine = prevJson == null
+      ? '''
+Task: Create an itinerary skeleton for: "$prompt".
+- Ensure Day 1 includes Arrival + Accommodation.
+- Use realistic times for activities as per local norms.
+'''
+      : '''
+Task: Refine the existing itinerary in-place using: "$prompt".
+- Keep destination, dates, and day count unless explicitly requested to change.
+- Only adjust items relevant to the user request; preserve unrelated ones.
+- If replacing a generic meal or hotel, keep the same time slot but update to a specific named place (with "place") and ensure it's realistic for that time.
+- Return the FULL updated JSON per Spec A.
+''';
+
+  return '''
+$base
+$refine
+
 Previous itinerary JSON: ${prevJson ?? "null"}
 Chat history: ${chatHistoryJson ?? "null"}
 ''';
+}
 
 // Spec A validator: location must be human-readable
 String? _validateSpecA(Map<String, dynamic> j) {
@@ -209,6 +365,8 @@ Future<_Enrichment> _enrichSkeleton(
   required Map<String, double> destCenter,
   required int radiusMeters,
   String? placesKey,
+  void Function(Map<String, dynamic> partialItinerary, Map<String, dynamic> partialAux)? onDelta,
+  _Budget budget = _Budget.mid,
 }) async {
   final destination = (skel['destination']?.toString() ?? '').trim();
   final title = skel['title']?.toString() ?? (destination.isNotEmpty ? '$destination Trip' : 'Trip');
@@ -223,9 +381,14 @@ Future<_Enrichment> _enrichSkeleton(
     final d = days[dIdx];
     final date = '${d['date'] ?? ''}';
     final summary = '${d['summary'] ?? ''}';
-    final items = (d['items'] as List? ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    var items = (d['items'] as List? ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
 
-    // Resolve all items in parallel to minimize latency
+    // >>> NEW: ensure Arrival + Accommodation on Day 1 and adjust times for known activities
+    if (dIdx == 0) {
+      _ensureArrivalAndStayOnDay0(destination, budget, items);
+    }
+    _nudgeTimesForKnownActivities(destination, items);
+
     final futures = <Future<void>>[];
     final resolved = List<Map<String, dynamic>>.filled(items.length, {});
     final meta = List<Map<String, dynamic>>.filled(items.length, {});
@@ -235,39 +398,34 @@ Future<_Enrichment> _enrichSkeleton(
       futures.add(() async {
         final time = '${it['time'] ?? ''}';
         final activity = '${it['activity'] ?? ''}';
-        final route = it['route'] is Map ? Map<String, dynamic>.from(it['route'] as Map) : null;
-        final placeRaw = it['place']?.toString();
-        final searchRaw = it['search']?.toString();
+        final route = it['route'] is Map ? Map<String, dynamic>.from(it['route'] as Map) : null; // ignore route
+        final placeRaw = (it['place']?.toString().trim().isNotEmpty ?? false)
+            ? it['place']?.toString()
+            : (route?['to']?.toString());
+        final searchRaw0 = it['search']?.toString();
 
-        if (route != null) {
-          // Travel: compute duration/distance; location -> toName
-          final fromName = route['from']?.toString() ?? destination;
-          final toName = route['to']?.toString() ?? destination;
-          final fromGeo = await _geocodeInRadius(fromName, destCenter, radiusMeters);
-          final toGeo = await _geocodeInRadius(toName, destCenter, radiusMeters);
-          final m = <String, dynamic>{};
-          if (fromGeo != null && toGeo != null) {
-            final osrm = await _osrmRoute(fromGeo['lat']!, fromGeo['lon']!, toGeo['lat']!, toGeo['lon']!);
-            m['lat'] = toGeo['lat'];
-            m['lon'] = toGeo['lon'];
-            m['distance'] = osrm['distanceText'];
-            m['duration'] = osrm['durationText'];
-            m['mapLink'] = _mapsDirLink(fromName, toName);
-            m['address'] = toName;
-          }
-          resolved[iIdx] = {'time': time, 'activity': activity.isNotEmpty ? activity : 'Travel', 'location': toName};
-          meta[iIdx] = m;
-          return;
-        }
+        // Heuristics
+        final actL = activity.toLowerCase();
+        final isMeal = actL.contains('lunch') || actL.contains('dinner') || actL.contains('breakfast') || (searchRaw0?.toLowerCase().contains('restaurant') ?? false);
+        final isLodging = actL.contains('hotel') || actL.contains('check-in') || actL.contains('check in') || actL.contains('resort') || actL.contains('accommodation') ||
+                          (placeRaw?.toLowerCase().contains('hotel') ?? false) || (searchRaw0?.toLowerCase().contains('hotel') ?? false) || (placeRaw?.toLowerCase().contains('resort') ?? false);
 
-        // POI / Restaurant
+        // Budget-biased search text
+        final searchRaw = (budget == _Budget.low && searchRaw0 != null && searchRaw0.trim().isNotEmpty)
+            ? '$searchRaw0 cheap affordable budget'
+            : searchRaw0;
+
         Map<String, dynamic>? poi;
         if (placeRaw != null && placeRaw.trim().isNotEmpty) {
-          poi = await _findNamedPOI(placeRaw, destCenter, radiusMeters);
+          poi = isLodging
+              ? await _findLodging(placeRaw, destCenter, 2500, placesKey: placesKey, budget: budget) ?? await _findNamedPOI(placeRaw, destCenter, radiusMeters)
+              : await _findPlacePrecise(placeRaw, destCenter, radiusMeters, placesKey: placesKey) ?? await _findNamedPOI(placeRaw, destCenter, radiusMeters);
         } else if (searchRaw != null && searchRaw.trim().isNotEmpty) {
-          // If it's a meal, prefer restaurants around the destination center (or later: around previous anchor)
-          poi = await _findRestaurant(searchRaw, destCenter, 1800, placesKey: placesKey);
-          poi ??= await _findNamedPOI(searchRaw, destCenter, radiusMeters);
+          poi = isMeal
+              ? await _findRestaurant(searchRaw, destCenter, 1800, placesKey: placesKey, budget: budget) ?? await _findNamedPOI(searchRaw, destCenter, radiusMeters)
+              : (isLodging
+                  ? await _findLodging(searchRaw, destCenter, 2500, placesKey: placesKey, budget: budget) ?? await _findNamedPOI(searchRaw, destCenter, radiusMeters)
+                  : await _findPlacePrecise(searchRaw, destCenter, radiusMeters, placesKey: placesKey) ?? await _findNamedPOI(searchRaw, destCenter, radiusMeters));
         }
 
         final locationName = poi?['name']?.toString() ??
@@ -277,22 +435,29 @@ Future<_Enrichment> _enrichSkeleton(
 
         final m = <String, dynamic>{};
         if (poi != null) {
+          // include exact name so UI can show it and fallbacks work
+          if (poi['name'] != null) m['name'] = poi['name'];
           m['lat'] = poi['lat'];
           m['lon'] = poi['lon'];
           m['address'] = poi['address'] ?? locationName;
           m['mapLink'] = poi['mapLink'] ?? _mapsSearchLink(poi['lat'] as double, poi['lon'] as double);
           if (poi['rating'] != null) m['rating'] = poi['rating'];
           if (poi['userRatings'] != null) m['userRatings'] = poi['userRatings'];
-          m['snippet'] = await _wikiSnippet(locationName, poi['lat'] as double, poi['lon'] as double);
+          if (poi['priceLevel'] != null) {
+            m['priceLevel'] = poi['priceLevel'];
+            m['price'] = _priceSymbol((poi['priceLevel'] as num?)?.toInt());
+          }
+          if (kEnableWikiSnippet) {
+            m['snippet'] = await _wikiSnippet(locationName, poi['lat'] as double, poi['lon'] as double);
+          }
         }
 
-        resolved[iIdx] = {'time': time, 'activity': activity, 'location': locationName};
+        resolved[iIdx] = {'time': time, 'activity': activity, 'location': locationName, 'geo': m};
         meta[iIdx] = m;
       }());
     }
     await Future.wait(futures);
 
-    // Reorder items for proximity within time slots while keeping meals in their slots
     final orderedIndex = _orderByProximity(resolved, meta);
     final orderedItems = <Map<String, dynamic>>[];
     for (final idx in orderedIndex) {
@@ -301,6 +466,13 @@ Future<_Enrichment> _enrichSkeleton(
     }
 
     outDays.add({'date': date, 'summary': summary, 'items': orderedItems});
+
+    if (onDelta != null) {
+      onDelta(
+        {'title': title, 'startDate': startDate, 'endDate': endDate, 'days': List<Map<String, dynamic>>.from(outDays)},
+        Map<String, dynamic>.from(aux),
+      );
+    }
   }
 
   return _Enrichment(
@@ -361,20 +533,22 @@ List<int> _orderByProximity(List<Map<String, dynamic>> items, List<Map<String, d
 
 /* ----------------------------- Data source fns ----------------------------- */
 
-// Nominatim geocode
+// Geocode with cache
 Future<Map<String, double>?> _geocodeOSM(String query) async {
+  if (_geocodeCache.containsKey(query)) return _geocodeCache[query];
   final uri = Uri.https('nominatim.openstreetmap.org', '/search', {'q': query, 'format': 'json', 'limit': '1'});
   try {
     final resp = await http.get(uri, headers: {'User-Agent': 'smart-trip-planner/0.3 (contact@example.com)'}).timeout(const Duration(seconds: 10));
-    if (resp.statusCode != 200) return null;
+    if (resp.statusCode != 200) { _geocodeCache[query] = null; return null; }
     final arr = jsonDecode(resp.body) as List;
-    if (arr.isEmpty) return null;
+    if (arr.isEmpty) { _geocodeCache[query] = null; return null; }
     final m = arr.first as Map<String, dynamic>;
     final lat = double.tryParse('${m['lat']}');
     final lon = double.tryParse('${m['lon']}');
-    if (lat == null || lon == null) return null;
-    return {'lat': lat, 'lon': lon};
-  } catch (_) { return null; }
+    final r = (lat == null || lon == null) ? null : {'lat': lat, 'lon': lon};
+    _geocodeCache[query] = r;
+    return r;
+  } catch (_) { _geocodeCache[query] = null; return null; }
 }
 
 Future<Map<String, double>?> _geocodeInRadius(String query, Map<String, double> center, int radiusMeters) async {
@@ -385,57 +559,89 @@ Future<Map<String, double>?> _geocodeInRadius(String query, Map<String, double> 
   return null;
 }
 
-// Named POI via Overpass name match, fallback to geocode
-Future<Map<String, dynamic>?> _findNamedPOI(String name, Map<String, double> center, int radius) async {
-  final q = '''
-[out:json][timeout:25];
-(
-  node(around:$radius,${center['lat']},${center['lon']})[name~"${_esc(name)}",i];
-  way(around:$radius,${center['lat']},${center['lon']})[name~"${_esc(name)}",i];
-  relation(around:$radius,${center['lat']},${center['lon']})[name~"${_esc(name)}",i];
-);
-out center 20;
-''';
+// Fallback: find a named POI using OSM Nominatim within a radius
+Future<Map<String, dynamic>?> _findNamedPOI(String query, Map<String, double> center, int radius) async {
+  final cacheKey = 'named:$query@${center['lat']},${center['lon']}~$radius';
+  if (_poiCache.containsKey(cacheKey)) return _poiCache[cacheKey];
+
   try {
-    final resp = await http.post(
-      Uri.parse('https://overpass-api.de/api/interpreter'),
-      headers: {'Content-Type': 'text/plain; charset=UTF-8', 'User-Agent': 'smart-trip-planner/0.3 (contact@example.com)'},
-      body: q,
-    ).timeout(const Duration(seconds: 25));
+    final params = {
+      'q': query,
+      'format': 'json',
+      'limit': '5',
+      'addressdetails': '1',
+      'namedetails': '1',
+    };
+    final uri = Uri.https('nominatim.openstreetmap.org', '/search', params);
+    final resp = await http.get(uri, headers: {'User-Agent': 'smart-trip-planner/0.3 (contact@example.com)'}).timeout(const Duration(seconds: 10));
     if (resp.statusCode == 200) {
-      final json = jsonDecode(resp.body) as Map<String, dynamic>;
-      final els = (json['elements'] as List? ?? []);
-      if (els.isNotEmpty) {
-        final m = els.first as Map<String, dynamic>;
-        final tags = (m['tags'] as Map?) ?? {};
-        final nameOut = '${tags['name'] ?? name}';
-        double? lat, lon;
-        if (m['lat'] != null && m['lon'] != null) { lat = (m['lat'] as num).toDouble(); lon = (m['lon'] as num).toDouble(); }
-        else if (m['center'] != null) { lat = (m['center']['lat'] as num).toDouble(); lon = (m['center']['lon'] as num).toDouble(); }
-        if (lat != null && lon != null) {
-          return {'name': nameOut, 'lat': lat, 'lon': lon, 'address': tags['addr:full'] ?? tags['addr:street'] ?? nameOut};
+      final arr = jsonDecode(resp.body) as List;
+      Map<String, dynamic>? best;
+      double bestDist = double.infinity;
+      for (final e in arr) {
+        final m = e as Map<String, dynamic>;
+        final lat = double.tryParse('${m['lat']}');
+        final lon = double.tryParse('${m['lon']}');
+        if (lat == null || lon == null) continue;
+        final distKm = _haversine(center['lat']!, center['lon']!, lat, lon);
+        if (distKm * 1000 <= radius && distKm < bestDist) {
+          best = {
+            'name': (m['namedetails']?['name'] ?? m['display_name'] ?? query).toString(),
+            'lat': lat,
+            'lon': lon,
+            'address': (m['display_name'] ?? query).toString(),
+            'mapLink': _mapsSearchLink(lat, lon),
+          };
+          bestDist = distKm;
         }
       }
+      if (best == null && arr.isNotEmpty) {
+        final m = arr.first as Map<String, dynamic>;
+        final lat = double.tryParse('${m['lat']}');
+        final lon = double.tryParse('${m['lon']}');
+        if (lat != null && lon != null) {
+          best = {
+            'name': (m['namedetails']?['name'] ?? m['display_name'] ?? query).toString(),
+            'lat': lat,
+            'lon': lon,
+            'address': (m['display_name'] ?? query).toString(),
+            'mapLink': _mapsSearchLink(lat, lon),
+          };
+        }
+      }
+      _poiCache[cacheKey] = best;
+      return best;
     }
   } catch (_) {}
-  // fallback to in-bounds geocode
-  final g = await _geocodeInRadius(name, center, radius);
-  if (g != null) {
-    return {'name': name, 'lat': g['lat'], 'lon': g['lon'], 'address': name};
+
+  final r = await _geocodeInRadius(query, center, radius);
+  if (r != null) {
+    final out = {
+      'name': query,
+      'lat': r['lat']!,
+      'lon': r['lon']!,
+      'address': query,
+      'mapLink': _mapsSearchLink(r['lat']!, r['lon']!),
+    };
+    _poiCache[cacheKey] = out;
+    return out;
   }
+
+  _poiCache[cacheKey] = null;
   return null;
 }
 
-// Restaurants with ratings using Google Places (if key), else Overpass minimal
-Future<Map<String, dynamic>?> _findRestaurant(String queryOrHint, Map<String, double> center, int radius, {String? placesKey}) async {
-  // Prefer Google Places Text Search (best ratings + links)
+// Prefer precise place (any type) using Google Places when available
+Future<Map<String, dynamic>?> _findPlacePrecise(String query, Map<String, double> center, int radius, {String? placesKey}) async {
+  final cacheKey = 'place:$query@${center['lat']},${center['lon']}~$radius~${placesKey != null}';
+  if (_poiCache.containsKey(cacheKey)) return _poiCache[cacheKey];
+
   if (placesKey != null) {
     try {
       final params = {
-        'query': queryOrHint,
+        'query': query,
         'location': '${center['lat']},${center['lon']}',
         'radius': '$radius',
-        'type': 'restaurant',
         'key': placesKey,
       };
       final uri = Uri.https('maps.googleapis.com', '/maps/api/place/textsearch/json', params);
@@ -444,7 +650,6 @@ Future<Map<String, dynamic>?> _findRestaurant(String queryOrHint, Map<String, do
         final j = jsonDecode(resp.body) as Map<String, dynamic>;
         final results = (j['results'] as List? ?? []);
         if (results.isNotEmpty) {
-          // Choose top by rating then user_ratings_total
           results.sort((a, b) {
             final ra = (a['rating'] as num?)?.toDouble() ?? 0;
             final rb = (b['rating'] as num?)?.toDouble() ?? 0;
@@ -461,29 +666,194 @@ Future<Map<String, dynamic>?> _findRestaurant(String queryOrHint, Map<String, do
           final userRatings = (r['user_ratings_total'] as num?)?.toInt();
           final placeId = '${r['place_id']}';
           if (lat != null && lon != null) {
-            return {
+            final out = {
               'name': name,
               'lat': lat,
               'lon': lon,
               'address': r['formatted_address'] ?? name,
               'rating': rating,
               'userRatings': userRatings,
+              'priceLevel': (r['price_level'] as num?)?.toInt(),
               'mapLink': 'https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(name)}&query_place_id=$placeId',
             };
+            _poiCache[cacheKey] = out;
+            return out;
           }
         }
       }
     } catch (_) {}
   }
 
-  // Minimal Overpass fallback (no ratings)
+  final fallback = await _findNamedPOI(query, center, radius);
+  _poiCache[cacheKey] = fallback;
+  return fallback;
+}
+
+// Hotels / lodging (budget-aware)
+Future<Map<String, dynamic>?> _findLodging(String queryOrHint, Map<String, double> center, int radius, {String? placesKey, _Budget budget = _Budget.mid}) async {
+  final cacheKey = 'lodging:$queryOrHint@${center['lat']},${center['lon']}~$radius~${placesKey != null}~$budget';
+  if (_poiCache.containsKey(cacheKey)) return _poiCache[cacheKey];
+
+  if (placesKey != null) {
+    try {
+      final params = {
+        'query': queryOrHint,
+        'location': '${center['lat']},${center['lon']}',
+        'radius': '$radius',
+        'type': 'lodging',
+        'key': placesKey,
+      };
+      final uri = Uri.https('maps.googleapis.com', '/maps/api/place/textsearch/json', params);
+      final resp = await http.get(uri).timeout(const Duration(seconds: 10));
+      if (resp.statusCode == 200) {
+        final j = jsonDecode(resp.body) as Map<String, dynamic>;
+        final results = (j['results'] as List? ?? []);
+        if (results.isNotEmpty) {
+          results.sort((a, b) => _scorePlace(Map<String, dynamic>.from(b as Map), budget)
+              .compareTo(_scorePlace(Map<String, dynamic>.from(a as Map), budget)));
+          var r = Map<String, dynamic>.from(results.first as Map);
+          if (budget == _Budget.low) {
+            final cheap = results.where((e) => ((e['price_level'] as num?)?.toInt() ?? 2) <= 2).toList();
+            if (cheap.isNotEmpty) r = Map<String, dynamic>.from(cheap.first as Map);
+          }
+          final name = '${r['name']}';
+          final lat = (r['geometry']?['location']?['lat'] as num?)?.toDouble();
+          final lon = (r['geometry']?['location']?['lng'] as num?)?.toDouble();
+          final rating = (r['rating'] as num?)?.toDouble();
+          final userRatings = (r['user_ratings_total'] as num?)?.toInt();
+          final placeId = '${r['place_id']}';
+          if (lat != null && lon != null) {
+            final out = {
+              'name': name,
+              'lat': lat,
+              'lon': lon,
+              'address': r['formatted_address'] ?? name,
+              'rating': rating,
+              'userRatings': userRatings,
+              'priceLevel': (r['price_level'] as num?)?.toInt(),
+              'mapLink': 'https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(name)}&query_place_id=$placeId',
+            };
+            _poiCache[cacheKey] = out;
+            return out;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  final fallback = await _findNamedPOI(queryOrHint, center, radius);
+  _poiCache[cacheKey] = fallback;
+  return fallback;
+}
+
+// Restaurants (budget-aware) – adaptive radius + distance-aware ranking
+Future<Map<String, dynamic>?> _findRestaurant(
+  String queryOrHint,
+  Map<String, double> center,
+  int radius, {
+  String? placesKey,
+  _Budget budget = _Budget.mid,
+}) async {
+  final cacheKey = 'rest:$queryOrHint@${center['lat']},${center['lon']}~$radius~${placesKey != null}~$budget';
+  if (_poiCache.containsKey(cacheKey)) return _poiCache[cacheKey];
+
+  // helper: convert Google result -> POI map
+  Map<String, dynamic>? _toPoi(Map r) {
+    final name = '${r['name']}';
+    final lat = (r['geometry']?['location']?['lat'] as num?)?.toDouble();
+    final lon = (r['geometry']?['location']?['lng'] as num?)?.toDouble();
+    if (lat == null || lon == null) return null;
+    final rating = (r['rating'] as num?)?.toDouble();
+    final userRatings = (r['user_ratings_total'] as num?)?.toInt();
+    final placeId = '${r['place_id']}';
+    return {
+      'name': name,
+      'lat': lat,
+      'lon': lon,
+      'address': r['formatted_address'] ?? name,
+      'rating': rating,
+      'userRatings': userRatings,
+      'priceLevel': (r['price_level'] as num?)?.toInt(),
+      'mapLink': 'https://www.google.com/maps/search/?api=1&query=${Uri.encodeComponent(name)}&query_place_id=$placeId',
+    };
+  }
+
+  // Rank by quality and proximity to destination center
+  num _rank(Map r) {
+    final s = _scorePlace(Map<String, dynamic>.from(r), budget);
+    final lat = (r['geometry']?['location']?['lat'] as num?)?.toDouble();
+    final lon = (r['geometry']?['location']?['lng'] as num?)?.toDouble();
+    if (lat == null || lon == null) return s;
+    final dKm = _haversine(center['lat']!, center['lon']!, lat, lon);
+    // small distance penalty to prefer close options
+    return s - (dKm * 0.08); // tweakable
+  }
+
+  if (placesKey != null) {
+    try {
+      // Try with adaptive radius to keep specificity but avoid wrong city
+      final tries = <int>[
+        radius,
+        math.min(radius * 2, 30000),
+        40000, // final broadened search
+      ];
+
+      Map<String, dynamic>? chosen;
+      for (final rads in tries) {
+        final params = {
+          'query': queryOrHint,
+          'location': '${center['lat']},${center['lon']}',
+          'radius': '$rads',
+          'type': 'restaurant',
+          'key': placesKey,
+        };
+        final uri = Uri.https('maps.googleapis.com', '/maps/api/place/textsearch/json', params);
+        final resp = await http.get(uri).timeout(const Duration(seconds: 10));
+        if (resp.statusCode != 200) continue;
+
+        final j = jsonDecode(resp.body) as Map<String, dynamic>;
+        final results = (j['results'] as List? ?? []);
+        if (results.isEmpty) continue;
+
+        // Sort by combined score (quality + proximity), then apply budget filter
+        results.sort((a, b) => _rank(b as Map).compareTo(_rank(a as Map)));
+
+        // If low budget, try to select <= $$ when available among top N
+        final topN = results.take(8).toList();
+        Map<String, dynamic>? pick;
+        if (budget == _Budget.low) {
+          final cheap = topN.where((e) => ((e['price_level'] as num?)?.toInt() ?? 2) <= 2).toList();
+          if (cheap.isNotEmpty) pick = Map<String, dynamic>.from(cheap.first as Map);
+        }
+        pick ??= Map<String, dynamic>.from(topN.first as Map);
+
+        final candidate = _toPoi(pick);
+        if (candidate != null) {
+          // Discard if very far (> 45km) which is likely wrong city
+          final distKm = _haversine(center['lat']!, center['lon']!, candidate['lat'] as double, candidate['lon'] as double);
+          if (distKm <= 45) {
+            chosen = candidate;
+            break;
+          }
+          // otherwise continue to next broaden try
+        }
+      }
+
+      if (chosen != null) {
+        _poiCache[cacheKey] = chosen;
+        return chosen;
+      }
+    } catch (_) {/* fall through to OSM */}
+  }
+
+  // OSM fallback (no ratings). Prefer closest named restaurant.
   final q = '''
 [out:json][timeout:25];
 (
-  node(around:$radius,${center['lat']},${center['lon']})["amenity"="restaurant"]["name"];
-  way(around:$radius,${center['lat']},${center['lon']})["amenity"="restaurant"]["name"];
+  node(around:${math.max(radius, 1500)},${center['lat']},${center['lon']})["amenity"="restaurant"]["name"];
+  way(around:${math.max(radius, 1500)},${center['lat']},${center['lon']})["amenity"="restaurant"]["name"];
 );
-out center 10;
+out center 15;
 ''';
   try {
     final resp = await http.post(
@@ -494,18 +864,26 @@ out center 10;
     if (resp.statusCode == 200) {
       final json = jsonDecode(resp.body) as Map<String, dynamic>;
       final els = (json['elements'] as List? ?? []);
-      if (els.isNotEmpty) {
-        final e = els.first as Map<String, dynamic>;
+      Map<String, dynamic>? best;
+      double bestDist = double.infinity;
+      for (final e in els) {
+        final m = e as Map<String, dynamic>;
         double? lat, lon;
-        if (e['lat'] != null && e['lon'] != null) { lat = (e['lat'] as num).toDouble(); lon = (e['lon'] as num).toDouble(); }
-        else if (e['center'] != null) { lat = (e['center']['lat'] as num).toDouble(); lon = (e['center']['lon'] as num).toDouble(); }
-        final name = (e['tags']?['name'] ?? 'Restaurant').toString();
-        if (lat != null && lon != null) {
-          return {'name': name, 'lat': lat, 'lon': lon, 'address': name, 'mapLink': _mapsSearchLink(lat, lon)};
+        if (m['lat'] != null && m['lon'] != null) { lat = (m['lat'] as num).toDouble(); lon = (m['lon'] as num).toDouble(); }
+        else if (m['center'] != null) { lat = (m['center']['lat'] as num).toDouble(); lon = (m['center']['lon'] as num).toDouble(); }
+        final name = (m['tags']?['name'] ?? '').toString();
+        if (lat == null || lon == null || name.isEmpty) continue;
+        final dKm = _haversine(center['lat']!, center['lon']!, lat, lon);
+        if (dKm < bestDist) {
+          bestDist = dKm;
+          best = {'name': name, 'lat': lat, 'lon': lon, 'address': name, 'mapLink': _mapsSearchLink(lat, lon)};
         }
       }
+      _poiCache[cacheKey] = best;
+      return best;
     }
   } catch (_) {}
+  _poiCache[cacheKey] = null;
   return null;
 }
 
