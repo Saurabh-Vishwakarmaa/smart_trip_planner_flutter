@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:smart_trip_planner_flutter/data/local/local_store.dart';
 import 'package:smart_trip_planner_flutter/presentations/screens/echo_screen.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await LocalStore.instance.init(); // Hive init/open
   runApp(const ProviderScope(child: MyApp()));
 }
 

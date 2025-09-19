@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:smart_trip_planner_flutter/data/local/local_store.dart';
+import 'package:smart_trip_planner_flutter/presentation/provider/connectivity_provider.dart';
 import 'package:smart_trip_planner_flutter/presentation/provider/agent_provider.dart';
 
 class AgentScreen extends ConsumerStatefulWidget {
@@ -26,6 +28,12 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
     final state = ref.watch(agentStateProvider);
     final hasItinerary = state.hasValue && (state.value?.itinerary.isNotEmpty ?? false);
     final isError = state.hasError;
+    final isOnline = ref.watch(onlineProvider);
+    final readOnly = ref.watch(agentReadOnlyProvider);
+    final savedTrips = ref.watch(savedTripsProvider).maybeWhen(
+      data: (list) => list,
+      orElse: () => const <SavedTrip>[],
+    );
 
     return Scaffold(
       appBar: AppBar(
@@ -63,8 +71,10 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
             error: (e, _) => _ChatThread(
               userText: _lastPrompt ?? '',
               child: _AiErrorCard(
-                message: 'Oops! The LLM failed to generate answer. Please regenerate.',
+                message: isOnline ? 'Oops! The LLM failed to generate answer. Please regenerate.'
+                                   : 'You are offline. Open a saved trip or reconnect.',
                 onRegenerate: () {
+                  if (!isOnline) return;
                   final prompt = _lastPrompt ?? _ctrl.text.trim();
                   if (prompt.isNotEmpty) {
                     ref.read(agentStateProvider.notifier).sendPrompt(prompt);
@@ -76,9 +86,16 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
               if (data.itinerary.isEmpty) {
                 return _HomePrompt(
                   controller: _ctrl,
+                  isOnline: isOnline,
+                  savedTrips: savedTrips,
+                  onOpenSaved: (t) => ref.read(agentStateProvider.notifier).loadFromLocal(t.json),
                   onCreatePressed: () {
                     final text = _ctrl.text.trim();
                     if (text.isEmpty) return;
+                    if (!isOnline) {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Offline. Open a saved trip or reconnect.')));
+                      return;
+                    }
                     setState(() => _lastPrompt = text);
                     ref.read(agentStateProvider.notifier).sendPrompt(text);
                   },
@@ -94,11 +111,27 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
                     Clipboard.setData(ClipboardData(text: j));
                     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Copied')));
                   },
-                  onSaveOffline: () {
-                    // Wire to local save if added; placeholder toast for now
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved offline')));
+                  onSaveOffline: () async {
+                    final it = data.itinerary;
+                    final title = (it['title'] ?? 'Trip').toString();
+                    final start = (it['startDate'] ?? '').toString();
+                    final end = (it['endDate'] ?? '').toString();
+                    await LocalStore.instance.saveItinerary(
+                      title: title,
+                      startDate: start,
+                      endDate: end,
+                      json: jsonEncode(it),
+                    );
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved offline')));
+                      ref.invalidate(savedTripsProvider);
+                    }
                   },
                   onRegenerate: () {
+                    if (!isOnline) {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Offline. Cannot regenerate.')));
+                      return;
+                    }
                     final prompt = _lastPrompt ?? _ctrl.text.trim();
                     if (prompt.isNotEmpty) {
                       ref.read(agentStateProvider.notifier).sendPrompt(prompt);
@@ -111,7 +144,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
         ),
       ),
       // Bottom action bar like mock: Follow up to refine + mic + send
-      bottomNavigationBar: (hasItinerary)
+      bottomNavigationBar: (hasItinerary && isOnline && !readOnly)
           ? SafeArea(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
@@ -203,16 +236,29 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
 
 // Home screen (prompt) like mock
 class _HomePrompt extends StatelessWidget {
-  const _HomePrompt({required this.controller, required this.onCreatePressed});
+  const _HomePrompt({required this.controller, required this.onCreatePressed, required this.isOnline, required this.savedTrips, required this.onOpenSaved});
   final TextEditingController controller;
   final VoidCallback onCreatePressed;
+  final bool isOnline;
+  final List<SavedTrip> savedTrips;
+  final void Function(SavedTrip trip) onOpenSaved;
 
   @override
   Widget build(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const Text('Hey Shubham 👋', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: Color(0xFF10B981))),
+        Row(
+          children: [
+            const Expanded(child: Text('Hey Shubham 👋', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: Color(0xFF10B981)))),
+            if (!isOnline)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(color: const Color(0xFFFFF7ED), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFF59E0B))),
+                child: const Text('Offline mode', style: TextStyle(fontSize: 12, color: Color(0xFF92400E), fontWeight: FontWeight.w700)),
+              ),
+          ],
+        ),
         const SizedBox(height: 14),
         const Text("What’s your vision\nfor this trip?", textAlign: TextAlign.left, style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
         const SizedBox(height: 12),
@@ -220,35 +266,40 @@ class _HomePrompt extends StatelessWidget {
           controller: controller,
           maxLines: 4,
           decoration: InputDecoration(
-            hintText: '7 days in Bali next April, 3 people, mid‑range budget, peaceful areas…',
+            hintText: isOnline ? '7 days in Bali next April, 3 people, mid‑range budget, peaceful areas…' : 'You are offline. Open a saved trip below.',
             suffixIcon: IconButton(onPressed: () {}, icon: const Icon(Icons.mic_none)),
             filled: true,
             fillColor: const Color(0xFFF6FAF9),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: Color(0xFFBDE7D6))),
           ),
+          readOnly: !isOnline,
         ),
         const SizedBox(height: 16),
         SizedBox(
           height: 48,
           child: InkWell(
             borderRadius: BorderRadius.circular(12),
-            onTap: onCreatePressed,
+            onTap: isOnline ? onCreatePressed : null,
             child: Ink(
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(12),
                 gradient: const LinearGradient(colors: [Color(0xFF10B981), Color(0xFF059669)]),
               ),
-              child: const Center(child: Text('Create My Itinerary', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700))),
+              child: Center(child: Text(isOnline ? 'Create My Itinerary' : 'Offline — open saved trip', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700))),
             ),
           ),
         ),
         const SizedBox(height: 24),
         const Text('Offline Saved itineraries', style: TextStyle(fontWeight: FontWeight.w600)),
         const SizedBox(height: 8),
-        _pill('Japan Trip, 20 days vacation…'),
-        _pill('India Trip, 7 days work trip…'),
-        _pill('Europe trip, Paris, Berlin, Dortmund…'),
-        _pill('Two days weekend getaway to somewhere…'),
+        if (savedTrips.isEmpty)
+          const Text('No saved trips yet', style: TextStyle(color: Colors.black54))
+        else
+          for (final t in savedTrips)
+            InkWell(
+              onTap: () => onOpenSaved(t),
+              child: _pill('${t.title}, ${t.startDate} → ${t.endDate}'),
+            ),
       ],
     );
   }
@@ -572,6 +623,8 @@ class _Bullet extends StatelessWidget {
     }
 
     final mapLink = _mapLinkOf(geo);
+    final distanceText = aux['distanceText']?.toString();
+    final durationText = aux['durationText']?.toString();
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
@@ -621,6 +674,40 @@ class _Bullet extends StatelessWidget {
               if (rating != null) _chip(Icons.star_rounded, '$rating${userRatings != null ? ' ($userRatings)' : ''}', color: const Color(0xFFF59E0B)),
               if (price != null && price.isNotEmpty) _chip(Icons.payments_outlined, price),
             ]),
+            if (mapLink != null) ...[
+              const SizedBox(height: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF5F6F8),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  InkWell(
+                    onTap: () async {
+                      final url = Uri.parse(mapLink);
+                      if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
+                        await launchUrl(url, mode: LaunchMode.platformDefault);
+                      }
+                    },
+                    child: Row(mainAxisSize: MainAxisSize.min, children: const [
+                      Icon(Icons.push_pin_rounded, size: 16, color: Color(0xFFEF4444)),
+                      SizedBox(width: 6),
+                      Text('Open in maps', style: TextStyle(color: Color(0xFF2563EB), fontWeight: FontWeight.w700)),
+                      SizedBox(width: 4),
+                      Icon(Icons.open_in_new_rounded, size: 14, color: Color(0xFF2563EB)),
+                    ]),
+                  ),
+                  if (distanceText != null || durationText != null) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      '${distanceText ?? ''}${(distanceText != null && durationText != null) ? ' | ' : ''}${durationText ?? ''}',
+                      style: const TextStyle(fontSize: 12, color: Colors.black87),
+                    ),
+                  ],
+                ]),
+              ),
+            ],
           ]),
         ),
       ]),

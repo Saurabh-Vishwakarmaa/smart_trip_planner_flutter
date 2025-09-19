@@ -1,9 +1,10 @@
-// lib/presentation/providers/agent_provider.dart
+
 import 'dart:isolate';
 import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:smart_trip_planner_flutter/data/services/agent_isolate.dart';
+import 'package:smart_trip_planner_flutter/presentation/provider/connectivity_provider.dart';
 
 class AgentResult {
   AgentResult({required this.itinerary, required this.tokens, required this.aux});
@@ -18,11 +19,34 @@ final agentPortProvider = FutureProvider<SendPort>((ref) async {
   return await rp.first as SendPort;
 });
 
+final agentReadOnlyProvider = StateProvider<bool>((ref) => false);
+
+// Extend AgentNotifier
 class AgentNotifier extends StateNotifier<AsyncValue<AgentResult>> {
   AgentNotifier(this.ref) : super(AsyncValue.data(AgentResult(itinerary: const {}, tokens: const {}, aux: const {})));
   final Ref ref;
 
+  void loadFromLocal(String jsonStr) {
+    try {
+      final map = Map<String, dynamic>.from(json.decode(jsonStr) as Map);
+      state = AsyncValue.data(AgentResult(itinerary: map, tokens: const {}, aux: const {}));
+      // mark read-only view
+      ref.read(agentReadOnlyProvider.notifier).state = true;
+    } catch (e, st) {
+      state = AsyncValue.error('Failed to open saved trip', st);
+    }
+  }
+
   Future<void> sendPrompt(String prompt, {String? prevJson}) async {
+    // Block when offline
+    final isOnline = ref.read(onlineProvider);
+    if (!isOnline) {
+      state = AsyncValue.error('You are offline. Open a saved trip or reconnect.', StackTrace.current);
+      return;
+    }
+    // leaving read-only mode for new/edited chats
+    ref.read(agentReadOnlyProvider.notifier).state = false;
+
     state = const AsyncValue.loading(); // Creating…
     try {
       final sendPort = await ref.read(agentPortProvider.future);

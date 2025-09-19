@@ -126,24 +126,8 @@ void agentWorker(SendPort sendPort) async {
   }
 }
 
-// >>> NEW: time rules for well-known activities (Varanasi examples)
-final _timeRules = <_TimeRule>[
-  _TimeRule(
-    where: (dest, text) => _containsAny(dest, ['varanasi', 'kashi', 'banaras']) &&
-                           _containsAny(text, ['ganga aarti', 'ganga arti', 'aarti', 'arti', 'dashashwamedh', 'assi ghat']),
-    prefer: ['19:00', '06:00'], // evening default, morning alt
-  ),
-  _TimeRule(
-    where: (dest, text) => _containsAny(dest, ['varanasi', 'kashi', 'banaras']) &&
-                           _containsAny(text, ['sunrise boat', 'morning boat', 'boat ride', 'subah-e-banaras']),
-    prefer: ['05:30'],
-  ),
-  _TimeRule(
-    where: (dest, text) => _containsAny(dest, ['varanasi', 'kashi']) &&
-                           _containsAny(text, ['sarnath']),
-    prefer: ['11:00', '15:00'],
-  ),
-];
+// Generic time nudges: none hard-coded; rely on LLM for locality schedules
+final _timeRules = <_TimeRule>[]; // previously had Varanasi-specific rules
 
 class _TimeRule {
   final bool Function(String destination, String text) where;
@@ -190,46 +174,13 @@ bool _timeLooksSaneFor(List<String> prefer, String current) {
 }
 
 String _lodgingSearchHint(String destination, _Budget budget) {
+  // Generic hint; no city-specific places
   final low = budget == _Budget.low;
-  if (_containsAny(destination, ['varanasi', 'kashi', 'banaras'])) {
-    return low
-        ? 'affordable budget hotels and guest houses near Dashashwamedh Ghat or Assi Ghat, Varanasi'
-        : 'best hotels near Dashashwamedh Ghat or Assi Ghat, Varanasi';
-  }
-  return low ? 'affordable budget hotels in $destination' : 'best hotels in $destination';
+  final prefix = low ? 'affordable budget hotels and guest houses' : 'best hotels';
+  return '$prefix near city center or major attractions in $destination';
 }
 
-void _ensureArrivalAndStayOnDay0(String destination, _Budget budget, List<Map<String, dynamic>> items) {
-  bool hasArrival = items.any((it) => _containsAny((it['activity'] ?? '').toString(), ['arrive', 'arrival', 'airport', 'transfer']));
-  bool hasStay = items.any((it) {
-    final a = (it['activity'] ?? '').toString().toLowerCase();
-    final p = (it['place'] ?? '').toString().toLowerCase();
-    final s = (it['search'] ?? '').toString().toLowerCase();
-    return a.contains('hotel') || a.contains('check-in') || a.contains('check in') || a.contains('stay') ||
-           p.contains('hotel') || s.contains('hotel') || p.contains('resort') || a.contains('accommodation');
-  });
-
-  // Insert Arrival (first item)
-  if (!hasArrival) {
-    items.insert(0, {
-      'time': '09:00',
-      'activity': 'Arrival',
-      'place': '$destination Airport', // helps resolve a real POI
-    });
-  }
-
-  // Insert Accommodation right after Arrival
-  if (!hasStay) {
-    final idx = items.length > 1 ? 1 : 0;
-    items.insert(idx, {
-      'time': '12:00',
-      'activity': 'Accommodation: Check-in',
-      'search': _lodgingSearchHint(destination, budget), // web search for stay
-    });
-  }
-}
-
-// >>> UPDATED: prompt — time-aware + arrival/stay + refine-in-place when prevJson present
+// >>> UPDATED: prompt — remove city-specific examples; keep rules generic
 String _promptInstruction(String prompt, String? prevJson, String? chatHistoryJson) {
   final base = '''
 You are a professional travel planner. Return ONLY JSON (no markdown) that follows Spec A:
@@ -254,9 +205,9 @@ You are a professional travel planner. Return ONLY JSON (no markdown) that follo
 Rules:
 - Use specific, known place names (avoid generic "hotel near ...").
 - Day 1 MUST start with Arrival in <destination> and an Accommodation/Check-in item.
-- last day should have the departure and when as after whole schedule
--times should be in sync one after another (e.g., 7 then 8 then 9 flow should be like this not random)
-- Times must be realistic and respect local schedules (e.g., in Varanasi: Ganga Aarti ~19:00–20:00 evening and ~06:00 morning; sunrise boat rides ~05:30).
+- last day of the trip should have the departure at the end after whole schedule or suitable.
+- times should be in sync one after another (e.g., 7 then 8 then 9 flow should be like this not random)
+- Times must be realistic and respect local schedules (e.g., sunrise activities near dawn; evening ceremonies around sunset; popular sites during opening hours).
 - 3–5 items/day with morning/lunch/afternoon/evening cadence.
 - DO NOT include route/travel items.
 ''';
@@ -383,7 +334,6 @@ Future<_Enrichment> _enrichSkeleton(
     final summary = '${d['summary'] ?? ''}';
     var items = (d['items'] as List? ?? []).map((e) => Map<String, dynamic>.from(e as Map)).toList();
 
-    // >>> NEW: ensure Arrival + Accommodation on Day 1 and adjust times for known activities
     if (dIdx == 0) {
       _ensureArrivalAndStayOnDay0(destination, budget, items);
     }
@@ -398,34 +348,104 @@ Future<_Enrichment> _enrichSkeleton(
       futures.add(() async {
         final time = '${it['time'] ?? ''}';
         final activity = '${it['activity'] ?? ''}';
-        final route = it['route'] is Map ? Map<String, dynamic>.from(it['route'] as Map) : null; // ignore route
-        final placeRaw = (it['place']?.toString().trim().isNotEmpty ?? false)
-            ? it['place']?.toString()
-            : (route?['to']?.toString());
+        final route = it['route'] is Map ? Map<String, dynamic>.from(it['route'] as Map) : null;
+        final placeRaw0 = (it['place']?.toString().trim().isNotEmpty ?? false) ? it['place']?.toString() : (route?['to']?.toString());
         final searchRaw0 = it['search']?.toString();
 
-        // Heuristics
         final actL = activity.toLowerCase();
         final isMeal = actL.contains('lunch') || actL.contains('dinner') || actL.contains('breakfast') || (searchRaw0?.toLowerCase().contains('restaurant') ?? false);
         final isLodging = actL.contains('hotel') || actL.contains('check-in') || actL.contains('check in') || actL.contains('resort') || actL.contains('accommodation') ||
-                          (placeRaw?.toLowerCase().contains('hotel') ?? false) || (searchRaw0?.toLowerCase().contains('hotel') ?? false) || (placeRaw?.toLowerCase().contains('resort') ?? false);
+            (placeRaw0?.toLowerCase().contains('hotel') ?? false) || (searchRaw0?.toLowerCase().contains('hotel') ?? false) || (placeRaw0?.toLowerCase().contains('resort') ?? false);
+
+        // Nearby anchor for meals
+        Map<String, double> centerForSearch = destCenter;
+        String? nearHint;
+        if (isMeal) {
+          final anchor = await _anchorForMealItem(index: iIdx, rawItems: items, destCenter: destCenter, radius: radiusMeters, placesKey: placesKey);
+          if (anchor != null) centerForSearch = anchor;
+          final prev = iIdx > 0 ? items[iIdx - 1] : null;
+          nearHint = (prev?['place'] ?? prev?['location'])?.toString();
+        }
 
         // Budget-biased search text
-        final searchRaw = (budget == _Budget.low && searchRaw0 != null && searchRaw0.trim().isNotEmpty)
-            ? '$searchRaw0 cheap affordable budget'
-            : searchRaw0;
+        String? searchRaw = (budget == _Budget.low && searchRaw0 != null && searchRaw0.trim().isNotEmpty)
+            ? '${searchRaw0.trim()} cheap affordable budget'
+            : searchRaw0?.trim();
+
+        // Strengthen weak queries with city/country/type context
+        if (searchRaw != null && searchRaw.isNotEmpty) {
+          searchRaw = _strengthenQuery(searchRaw, destination, isRestaurant: isMeal, isLodging: isLodging, nearHint: nearHint);
+        }
+
+        // For short "place" names, also strengthen to avoid wrong city matches
+        String? placeRaw = placeRaw0;
+        String? strengthenedPlaceForSearch;
+        if (placeRaw != null && _isSingleWeakTerm(placeRaw)) {
+          strengthenedPlaceForSearch = _strengthenQuery(placeRaw, destination, isRestaurant: isMeal, isLodging: isLodging, nearHint: nearHint);
+        }
 
         Map<String, dynamic>? poi;
+
+        Future<Map<String, dynamic>?> _retryIfFar(Map<String, dynamic>? candidate, Future<Map<String, dynamic>?> Function() secondTry) async {
+          if (candidate == null) return await secondTry();
+          if (_tooFarFrom(destCenter, candidate)) {
+            final retry = await secondTry();
+            if (retry != null && !_tooFarFrom(destCenter, retry)) return retry;
+            // keep closer of the two if retry also far
+            if (retry != null) {
+              final oldD = _haversine(destCenter['lat']!, destCenter['lon']!, (candidate['lat'] as num).toDouble(), (candidate['lon'] as num).toDouble());
+              final newD = _haversine(destCenter['lat']!, destCenter['lon']!, (retry['lat'] as num).toDouble(), (retry['lon'] as num).toDouble());
+              return newD < oldD ? retry : candidate;
+            }
+          }
+          return candidate;
+        }
+
         if (placeRaw != null && placeRaw.trim().isNotEmpty) {
+          // First attempt: exact place; if too weak, use the strengthened variant
           poi = isLodging
-              ? await _findLodging(placeRaw, destCenter, 2500, placesKey: placesKey, budget: budget) ?? await _findNamedPOI(placeRaw, destCenter, radiusMeters)
-              : await _findPlacePrecise(placeRaw, destCenter, radiusMeters, placesKey: placesKey) ?? await _findNamedPOI(placeRaw, destCenter, radiusMeters);
+              ? await _findLodging(placeRaw, centerForSearch, 2500, placesKey: placesKey, budget: budget)
+              : await _findPlacePrecise(placeRaw, centerForSearch, radiusMeters, placesKey: placesKey);
+
+          if (poi == null && strengthenedPlaceForSearch != null) {
+            poi = isLodging
+                ? await _findLodging(strengthenedPlaceForSearch, centerForSearch, 3000, placesKey: placesKey, budget: budget)
+                : await _findPlacePrecise(strengthenedPlaceForSearch, centerForSearch, math.max(radiusMeters, 2500), placesKey: placesKey);
+          }
+
+          // Retry with context if far
+          poi = await _retryIfFar(poi, () async {
+            final q = strengthenedPlaceForSearch ?? _strengthenQuery(placeRaw!, destination, isRestaurant: isMeal, isLodging: isLodging, nearHint: nearHint);
+            return isLodging
+                ? await _findLodging(q, destCenter, 4000, placesKey: placesKey, budget: budget) ??
+                    await _findNamedPOI(q, destCenter, math.max(radiusMeters, 3000))
+                : await _findPlacePrecise(q, destCenter, math.max(radiusMeters, 3000), placesKey: placesKey) ??
+                    await _findNamedPOI(q, destCenter, math.max(radiusMeters, 3000));
+          });
+
+          // OSM fallback
+          poi ??= await _findNamedPOI(placeRaw, centerForSearch, radiusMeters);
         } else if (searchRaw != null && searchRaw.trim().isNotEmpty) {
           poi = isMeal
-              ? await _findRestaurant(searchRaw, destCenter, 1800, placesKey: placesKey, budget: budget) ?? await _findNamedPOI(searchRaw, destCenter, radiusMeters)
+              ? await _findRestaurant(searchRaw, centerForSearch, 1800, placesKey: placesKey, budget: budget)
               : (isLodging
-                  ? await _findLodging(searchRaw, destCenter, 2500, placesKey: placesKey, budget: budget) ?? await _findNamedPOI(searchRaw, destCenter, radiusMeters)
-                  : await _findPlacePrecise(searchRaw, destCenter, radiusMeters, placesKey: placesKey) ?? await _findNamedPOI(searchRaw, destCenter, radiusMeters));
+                  ? await _findLodging(searchRaw, centerForSearch, 2500, placesKey: placesKey, budget: budget)
+                  : await _findPlacePrecise(searchRaw, centerForSearch, radiusMeters, placesKey: placesKey));
+
+          // Retry with destination-bias if far
+          poi = await _retryIfFar(poi, () async {
+            final q2 = _strengthenQuery(searchRaw!, destination, isRestaurant: isMeal, isLodging: isLodging, nearHint: nearHint);
+            return isMeal
+                ? await _findRestaurant(q2, destCenter, 3000, placesKey: placesKey, budget: budget) ??
+                    await _findNamedPOI(q2, destCenter, math.max(radiusMeters, 2500))
+                : (isLodging
+                    ? await _findLodging(q2, destCenter, 3500, placesKey: placesKey, budget: budget) ??
+                        await _findNamedPOI(q2, destCenter, math.max(radiusMeters, 2500))
+                    : await _findPlacePrecise(q2, destCenter, math.max(radiusMeters, 2500), placesKey: placesKey) ??
+                        await _findNamedPOI(q2, destCenter, math.max(radiusMeters, 2500)));
+          });
+
+          poi ??= await _findNamedPOI(searchRaw, centerForSearch, radiusMeters);
         }
 
         final locationName = poi?['name']?.toString() ??
@@ -435,7 +455,6 @@ Future<_Enrichment> _enrichSkeleton(
 
         final m = <String, dynamic>{};
         if (poi != null) {
-          // include exact name so UI can show it and fallbacks work
           if (poi['name'] != null) m['name'] = poi['name'];
           m['lat'] = poi['lat'];
           m['lon'] = poi['lon'];
@@ -456,12 +475,28 @@ Future<_Enrichment> _enrichSkeleton(
         meta[iIdx] = m;
       }());
     }
+
     await Future.wait(futures);
 
     final orderedIndex = _orderByProximity(resolved, meta);
     final orderedItems = <Map<String, dynamic>>[];
-    for (final idx in orderedIndex) {
+    for (int k = 0; k < orderedIndex.length; k++) {
+      final idx = orderedIndex[k];
       orderedItems.add(resolved[idx]);
+      if (k > 0) {
+        final prevIdx = orderedIndex[k - 1];
+        final aLat = (meta[prevIdx]['lat'] as num?)?.toDouble();
+        final aLon = (meta[prevIdx]['lon'] as num?)?.toDouble();
+        final bLat = (meta[idx]['lat'] as num?)?.toDouble();
+        final bLon = (meta[idx]['lon'] as num?)?.toDouble();
+        if (aLat != null && aLon != null && bLat != null && bLon != null) {
+          final dir = await _osrmRoute(aLat, aLon, bLat, bLon);
+          if (dir.isNotEmpty) {
+            meta[idx]['distanceText'] = dir['distanceText'];
+            meta[idx]['durationText'] = dir['durationText'];
+          }
+        }
+      }
       aux['$dIdx:$idx'] = meta[idx];
     }
 
@@ -475,10 +510,7 @@ Future<_Enrichment> _enrichSkeleton(
     }
   }
 
-  return _Enrichment(
-    {'title': title, 'startDate': startDate, 'endDate': endDate, 'days': outDays},
-    aux,
-  );
+  return _Enrichment({'title': title, 'startDate': startDate, 'endDate': endDate, 'days': outDays}, aux);
 }
 
 /* --------------------------- Ordering + utilities -------------------------- */
@@ -948,3 +980,123 @@ double _haversine(double lat1, double lon1, double lat2, double lon2) {
   return R * c;
 }
 double _deg2rad(double d) => d * 3.141592653589793 / 180.0;
+
+// Choose a nearby anchor (prev/next item) for meal search; fallback to destination center
+Future<Map<String, double>?> _anchorForMealItem({
+  required int index,
+  required List<Map<String, dynamic>> rawItems,
+  required Map<String, double> destCenter,
+  required int radius,
+  String? placesKey,
+}) async {
+  Future<Map<String, double>?> resolve(Map<String, dynamic> it) async {
+    final place = it['place']?.toString();
+    final search = it['search']?.toString();
+    final name = (place?.trim().isNotEmpty ?? false)
+        ? place!
+        : (search?.trim().isNotEmpty ?? false)
+            ? search!
+            : '';
+    if (name.isEmpty) return null;
+    final p = await _findPlacePrecise(name, destCenter, radius, placesKey: placesKey) ??
+        await _findNamedPOI(name, destCenter, radius);
+    if (p == null) return null;
+    return {'lat': (p['lat'] as num).toDouble(), 'lon': (p['lon'] as num).toDouble()};
+  }
+
+  if (index > 0) {
+    final c = await resolve(rawItems[index - 1]);
+    if (c != null) return c;
+  }
+  if (index + 1 < rawItems.length) {
+    final c = await resolve(rawItems[index + 1]);
+    if (c != null) return c;
+  }
+  return destCenter;
+}
+
+// Add Arrival + Accommodation on Day 1 in enrichment (websearch will resolve the stay)
+void _ensureArrivalAndStayOnDay0(String destination, _Budget budget, List<Map<String, dynamic>> items) {
+  bool hasArrival = items.any((it) {
+    final a = (it['activity'] ?? '').toString().toLowerCase();
+    return a.contains('arrive') || a.contains('arrival') || a.contains('airport') || a.contains('transfer');
+  });
+  bool hasStay = items.any((it) {
+    final a = (it['activity'] ?? '').toString().toLowerCase();
+    final p = (it['place'] ?? '').toString().toLowerCase();
+    final s = (it['search'] ?? '').toString().toLowerCase();
+    return a.contains('hotel') || a.contains('check-in') || a.contains('check in') || a.contains('accommodation') ||
+           p.contains('hotel') || p.contains('resort') || s.contains('hotel');
+  });
+
+  if (!hasArrival) {
+    items.insert(0, {'time': '09:00', 'activity': 'Arrival', 'place': '$destination Airport'});
+  }
+  if (!hasStay) {
+    final idx = items.length > 1 ? 1 : 0;
+    items.insert(idx, {
+      'time': '12:00',
+      'activity': 'Accommodation: Check-in',
+      'search': _lodgingSearchHint(destination, budget),
+    });
+  }
+}
+
+// --- Helpers to strengthen ambiguous queries ---
+
+List<String> _splitDestinationCityCountry(String destination) {
+  final parts = destination.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+  if (parts.isEmpty) return ['', ''];
+  if (parts.length == 1) return [parts.first, ''];
+  return [parts.first, parts.sublist(1).join(', ')];
+}
+
+bool _isSingleWeakTerm(String s) {
+  final t = s.trim();
+  if (t.isEmpty) return true;
+  // one word or very short
+  final words = t.split(RegExp(r'\s+'));
+  return words.length < 2 || t.length < 5;
+}
+
+String _strengthenQuery(
+  String raw,
+  String destination, {
+  bool isRestaurant = false,
+  bool isLodging = false,
+  String? nearHint,
+}) {
+  var q = raw.trim();
+  if (q.isEmpty) return q;
+
+  final lc = q.toLowerCase();
+  final hasNearOrIn = lc.contains(' near ') || lc.startsWith('near ') || lc.contains(' in ');
+  final cityCountry = _splitDestinationCityCountry(destination);
+  final city = cityCountry[0];
+  final country = cityCountry[1];
+  final placeCtx = (city.isNotEmpty && country.isNotEmpty) ? '$city, $country' : city.isNotEmpty ? city : destination;
+
+  // If query is too weak or lacks context, add type and locality
+  if (_isSingleWeakTerm(q) || !hasNearOrIn) {
+    if (isRestaurant && !lc.contains('restaurant')) {
+      q = 'restaurants $q';
+    } else if (isLodging && !(lc.contains('hotel') || lc.contains('resort') || lc.contains('guest'))) {
+      q = 'hotels $q';
+    }
+    if (!hasNearOrIn) {
+      final hint = (nearHint != null && nearHint.trim().isNotEmpty) ? nearHint.trim() : placeCtx;
+      q = '$q in $hint';
+    }
+  }
+
+  return q;
+}
+
+// Distance gate for likely-wrong cities
+bool _tooFarFrom(Map<String, double> center, Map<String, dynamic> poi, {double km = 45}) {
+  final lat = (poi['lat'] as num?)?.toDouble();
+  final lon = (poi['lon'] as num?)?.toDouble();
+  if (lat == null || lon == null) return true;
+  final dKm = _haversine(center['lat']!, center['lon']!, lat, lon);
+  return dKm > km;
+}
