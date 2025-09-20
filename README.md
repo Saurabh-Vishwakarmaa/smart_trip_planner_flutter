@@ -81,51 +81,59 @@ flutter run
 ## 2) Architecture diagram
 
 ```mermaid
-flowchart LR
-  subgraph UI[Presentation (Flutter)]
-    ECHO[echo_screen.dart\n(Home / Agent)]
-    PROF[Profile screen\n(tokens, cost)]
-    AUTH[Signup/Login\n(route flow)]
+flowchart TD
+  subgraph UI["Flutter UI"]
+    ECHO["Echo Screen\n(chat, itinerary)"]
+    PROF["Profile Screen\n(tokens, cost)"]
+    AUTH["Login / Signup"]
   end
 
-  subgraph State[State / Controllers]
-    RVP[Riverpod providers\nagentState, savedTrips, online]
-    SPEECH[SpeechService\n(speech_to_text)]
-    TTS[TtsService (optional)\n(flutter_tts)]
-    USAGE[usage_store (ValueNotifier)\nrequest/response tokens, cost]
+  subgraph State["State Layer (Riverpod)"]
+    PROVIDERS["Providers\n(agentState, savedTrips, online)"]
+    SPEECH["Speech-to-Text"]
+    TTS["Text-to-Speech (opt)"]
+    USAGE["Usage Store\n(tokens, cost)"]
   end
 
-  subgraph Isolate[Background Isolate]
-    AGENT[agent_isolate.dart\nagentWorker]
-    PROMPT[_promptInstruction()]
-    ENRICH[_enrichSkeleton()\nfinds POIs, orders, routes]
-    VALID[_validateSpecA()]
-    TOKENS[token_usage.dart]
+  subgraph Isolate["Agent Isolate"]
+    AGENT["agentWorker()"]
+    PROMPT["_promptInstruction()"]
+    ENRICH["_enrichSkeleton()\nPOIs, routes"]
+    VALID["_validateSpecA()"]
+    TOKENS["token_usage.dart"]
   end
 
-  subgraph External[External Services]
-    GEM[Gemini\n(google_generative_ai)]
-    NOMI[Nominatim OSM\n(geocode)]
-    PLACES[Google Places\n(text search)]
-    OVER[OSM Overpass\n(fallback POIs)]
-    OSRM[OSRM Router\n(distance/time)]
-    WIKI[Wikipedia\n(optional snippet)]
+  subgraph External["External Services"]
+    GEM["Gemini (LLM)"]
+    PLACES["Google Places API"]
+    NOMI["OSM Nominatim"]
+    OSRM["OSRM Router"]
+    OVER["OSM Overpass (fallback)"]
+    WIKI["Wikipedia (opt)"]
   end
 
-  ECHO -->|prompt / regenerate| RVP
-  ECHO -->|mic toggle| SPEECH
-  ECHO -->|speak (opt)| TTS
-  RVP -->|spawn + messages| AGENT
+  %% UI ↔ State
+  ECHO --> PROVIDERS
+  ECHO --> SPEECH
+
+  USAGE --> PROF
+  AUTH --> PROVIDERS
+
+  %% State ↔ Isolate
+  PROVIDERS --> AGENT
+  AGENT --> PROVIDERS
+
+  %% Isolate internals
   AGENT --> PROMPT --> GEM
   AGENT --> ENRICH
-  ENRICH --> NOMI
   ENRICH --> PLACES
-  ENRICH --> OVER
+  ENRICH --> NOMI
   ENRICH --> OSRM
+  ENRICH --> OVER
+  ENRICH --> WIKI
   AGENT --> VALID
   AGENT --> TOKENS --> USAGE
-  AGENT -->|delta/done| RVP --> ECHO
-  USAGE --> PROF
+
 ```
 
 ---
