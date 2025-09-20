@@ -324,7 +324,9 @@ class _RegisterpageState extends State<Registerpage> {
                 width: double.infinity,
                 height: 54,
                 child: ElevatedButton(
-                  onPressed: () {},
+                  onPressed: () {
+                    Navigator.pushNamed(context, '/login');
+                  },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: brand,
                     foregroundColor: Colors.white,

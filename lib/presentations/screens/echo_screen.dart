@@ -2,11 +2,14 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:smart_trip_planner_flutter/data/services/speechservice.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:smart_trip_planner_flutter/data/local/local_store.dart';
 import 'package:smart_trip_planner_flutter/presentation/provider/connectivity_provider.dart';
 import 'package:smart_trip_planner_flutter/presentation/provider/agent_provider.dart';
-import 'package:smart_trip_planner_flutter/presentations/screens/profile_screen.dart';
+import 'package:smart_trip_planner_flutter/presentations/screens/profile_screen.dart'; 
+
+
 
 class AgentScreen extends ConsumerStatefulWidget {
   const AgentScreen({super.key});
@@ -16,12 +19,36 @@ class AgentScreen extends ConsumerStatefulWidget {
 
 class _AgentScreenState extends ConsumerState<AgentScreen> {
   final _ctrl = TextEditingController();
-  String? _lastPrompt; // so we can show user bubble + regenerate
+  String? _lastPrompt;
+  late final SpeechService speech;
+  
+
+  @override
+  void initState() {
+    super.initState();
+    speech = SpeechService()..init();
+  }
 
   @override
   void dispose() {
+    speech.stop();
     _ctrl.dispose();
     super.dispose();
+  }
+
+  // Mic handler that uses the SAME instance
+  void _onMicPressed() async {
+    await speech.toggle(
+      currentText: _ctrl.text,
+      onText: (text, isFinal) {
+        _ctrl.text = text;
+        _ctrl.selection = TextSelection.fromPosition(
+          TextPosition(offset: _ctrl.text.length),
+        );
+        if (isFinal) speech.stop();
+        setState(() {});
+      },
+    );
   }
 
   @override
@@ -35,6 +62,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
       data: (list) => list,
       orElse: () => const <SavedTrip>[],
     );
+    
 
     return Scaffold(
       appBar: AppBar(
@@ -45,7 +73,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
                   ? (_lastPrompt == null || _lastPrompt!.isEmpty
                       ? 'Itinerary'
                       : (_lastPrompt!.length > 18 ? '${_lastPrompt!.substring(0, 18)}…' : _lastPrompt!))
-                  : "Home",
+                  : "",
         ),
         leading: (state.isLoading || hasItinerary || isError)
             ? IconButton(
@@ -58,7 +86,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
             padding: const EdgeInsets.only(right: 12),
             child: InkWell(
               borderRadius: BorderRadius.circular(20),
-              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ProfileScreen())),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ProfileScreen(name: 'Shubham', email: 'shubham1752004',))),
               child: const CircleAvatar(
                 radius: 18,
                 backgroundColor: Color(0xFF10B981),
@@ -76,8 +104,9 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
             error: (e, _) => _ChatThread(
               userText: _lastPrompt ?? '',
               child: _AiErrorCard(
-                message: isOnline ? 'Oops! The LLM failed to generate answer. Please regenerate.'
-                                   : 'You are offline. Open a saved trip or reconnect.',
+                message: isOnline
+                    ? 'Oops! The LLM failed to generate answer. Please regenerate.'
+                    : 'You are offline. Open a saved trip or reconnect.',
                 onRegenerate: () {
                   if (!isOnline) return;
                   final prompt = _lastPrompt ?? _ctrl.text.trim();
@@ -104,6 +133,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
                     setState(() => _lastPrompt = text);
                     ref.read(agentStateProvider.notifier).sendPrompt(text);
                   },
+                  onMicPressed: _onMicPressed, // <-- pass mic callback here
                 );
               }
               return _ChatThread(
@@ -237,18 +267,30 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
       ),
     );
   }
+
+
 }
 
-// Home screen 
+// Home screen
 class _HomePrompt extends StatelessWidget {
-  const _HomePrompt({required this.controller, required this.onCreatePressed, required this.isOnline, required this.savedTrips, required this.onOpenSaved});
+  const _HomePrompt({
+    required this.controller,
+    required this.onCreatePressed,
+    required this.isOnline,
+    required this.savedTrips,
+    required this.onOpenSaved,
+    required this.onMicPressed, // <-- new param
+  });
   final TextEditingController controller;
   final VoidCallback onCreatePressed;
   final bool isOnline;
   final List<SavedTrip> savedTrips;
   final void Function(SavedTrip trip) onOpenSaved;
+  final VoidCallback onMicPressed; // <-- new field
 
-  @override
+
+
+
   Widget build(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -265,17 +307,26 @@ class _HomePrompt extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 14),
-        const Text("What’s your vision\nfor this trip?", textAlign: TextAlign.left, style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
+        const Text("What’s your vision\nfor the trip?", textAlign: TextAlign.left, style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
         const SizedBox(height: 12),
         TextField(
           controller: controller,
           maxLines: 4,
           decoration: InputDecoration(
-            hintText: isOnline ? '7 days in Bali next April, 3 people, mid‑range budget, peaceful areas…' : 'You are offline. Open a saved trip below.',
-            suffixIcon: IconButton(onPressed: () {}, icon: const Icon(Icons.mic_none)),
+            hintText: isOnline
+                ? '7 days in Bali next April, 3 people, mid‑range budget, peaceful areas…'
+                : 'You are offline. Open a saved trip below.',
+            suffixIcon: IconButton(
+              onPressed: isOnline ? onMicPressed : null, // <-- use callback
+              icon: const Icon(Icons.mic_none),
+              tooltip: 'Speak',
+            ),
             filled: true,
             fillColor: const Color(0xFFF6FAF9),
-            border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: Color(0xFFBDE7D6))),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(16),
+              borderSide: const BorderSide(color: Color(0xFFBDE7D6)),
+            ),
           ),
           readOnly: !isOnline,
         ),
@@ -300,20 +351,20 @@ class _HomePrompt extends StatelessWidget {
         if (savedTrips.isEmpty)
           const Text('No saved trips yet', style: TextStyle(color: Colors.black54))
         else
-          for (final t in savedTrips)
+          for (int i = 0; i < savedTrips.length; i++)
             InkWell(
-              onTap: () => onOpenSaved(t),
-              child: _pill('${t.title}, ${t.startDate} → ${t.endDate}'),
-            ),
+              onTap: () => onOpenSaved(savedTrips[i]),
+              child: _pill('${savedTrips[i].title}, ${savedTrips[i].startDate} → ${savedTrips[i].endDate}', i),
+            )
       ],
     );
   }
 
-  Widget _pill(String text) => Container(
+  Widget _pill(String text,int t) => Container(
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
         decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), border: Border.all(color: const Color(0xFFE5E7EB))),
-        child: Row(children: [const Icon(Icons.circle, size: 10, color: Color(0xFF34D399)), const SizedBox(width: 8), Expanded(child: Text(text)),GestureDetector(child: Icon(Icons.delete))]),
+        child: Row(children: [const Icon(Icons.circle, size: 10, color: Color(0xFF34D399)), const SizedBox(width: 8), Expanded(child: Text(text)),GestureDetector(child: Icon(Icons.delete),onTap: () =>     savedTrips.removeAt(t),)]),
       );
 }
 

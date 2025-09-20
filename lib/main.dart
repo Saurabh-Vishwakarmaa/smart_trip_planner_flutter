@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:smart_trip_planner_flutter/authpages/loginpage.dart';
+import 'package:smart_trip_planner_flutter/authpages/signuppage.dart';
 import 'package:smart_trip_planner_flutter/data/local/local_store.dart';
 import 'package:smart_trip_planner_flutter/presentations/screens/echo_screen.dart';
 
@@ -17,6 +19,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     final base = ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFF10B981));
     return MaterialApp(
+      debugShowCheckedModeBanner: false,
       title: 'Smart Trip Planner',
       theme: base.copyWith(
         textTheme: GoogleFonts.interTextTheme(base.textTheme),
@@ -28,7 +31,12 @@ class MyApp extends StatelessWidget {
         ),
         scaffoldBackgroundColor: const Color(0xFFF8F8F8),
       ),
-      home: const AgentScreen(),
+    routes: {
+
+'/login': (context) =>  LoginPage(),
+'/home':(context) => AgentScreen()  
+    },
+      home:Registerpage(),
     );
   }
 }

@@ -1,4 +1,4 @@
-// lib/data/services/agent_isolate.dart
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
@@ -6,6 +6,7 @@ import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:smart_trip_planner_flutter/constants.dart';
+import 'package:smart_trip_planner_flutter/data/services/token_usage.dart'; // + add
 
 // In-memory caches to minimize API hits
 final _geocodeCache = <String, Map<String, double>?>{};
@@ -56,12 +57,15 @@ void agentWorker(SendPort sendPort) async {
         continue;
       }
 
+      const modelId = 'gemini-1.5-flash-latest'; // keep one source of truth
       final model = GenerativeModel(
-        model: 'gemini-1.5-flash-latest',
+        model: modelId,
         apiKey: geminiKey,
         generationConfig: GenerationConfig(responseMimeType: 'application/json'),
       );
+
       final instruction = _promptInstruction(prompt, prevJson, chatHistoryJson);
+
       final resp = await model.generateContent([Content.text(instruction)]);
       final raw = (resp.text ?? '').trim();
       if (raw.isEmpty) {
@@ -108,17 +112,20 @@ void agentWorker(SendPort sendPort) async {
         continue;
       }
 
+      // Build real tokens and cost; falls back to estimating from instruction/raw
+      final usage = buildTokenUsage(
+        modelId: modelId,
+        usage: resp.usageMetadata,
+        inputText: instruction,
+        outputText: raw,
+      );
+
       reply.send({
         "type": "done",
         "ok": true,
         "data": enrichment.itinerary,
         "aux": enrichment.aux,
-        "tokens": {
-          "prompt": resp.usageMetadata?.promptTokenCount ?? 0,
-          "completion": resp.usageMetadata?.candidatesTokenCount ?? 0,
-          "total": resp.usageMetadata?.totalTokenCount ?? 0,
-          "cost": 0
-        }
+        "tokens": usage.toJson(), // includes prompt, completion, total, costUSD
       });
     } catch (e) {
       try { reply.send({"type": "error", "ok": false, "data": e.toString()}); } catch (_) {}
@@ -126,8 +133,8 @@ void agentWorker(SendPort sendPort) async {
   }
 }
 
-// Generic time nudges: none hard-coded; rely on LLM for locality schedules
-final _timeRules = <_TimeRule>[]; // previously had Varanasi-specific rules
+
+final _timeRules = <_TimeRule>[]; 
 
 class _TimeRule {
   final bool Function(String destination, String text) where;
@@ -266,9 +273,38 @@ Map<String, dynamic> _safeDecodeMap(String raw) {
 // Ensure continuous dates
 Map<String, dynamic> _ensureContinuousDays(Map<String, dynamic> skel) {
   DateTime? start, end;
-  try { start = DateTime.parse('${skel['startDate']}'); end = DateTime.parse('${skel['endDate']}'); } catch (_) {}
+  try {
+    start = DateTime.parse('${skel['startDate']}');
+    end = DateTime.parse('${skel['endDate']}');
+  } catch (_) {}
+
   if (start == null || end == null || end.isBefore(start)) return skel;
 
+  final today = DateTime.now();
+
+  // If the trip is in the past, shift intelligently
+  if (end.isBefore(today)) {
+    final duration = end.difference(start).inDays;
+    // If the month/day are valid in the future, just bump the year
+    if (start.month > today.month ||
+        (start.month == today.month && start.day >= today.day)) {
+      // schedule for this year
+      start = DateTime(today.year, start.month, start.day);
+    } else {
+      // schedule for next year
+      start = DateTime(today.year + 1, start.month, start.day);
+    }
+    end = start.add(Duration(days: duration));
+  }
+
+  // If start is still before today (like if "yesterday"), push to tomorrow
+  if (start.isBefore(today)) {
+    final duration = end.difference(start).inDays;
+    start = DateTime(today.year, today.month, today.day).add(const Duration(days: 1));
+    end = start.add(Duration(days: duration));
+  }
+
+  // Build continuous day list
   final target = <String>[];
   for (var d = start; !d.isAfter(end); d = d.add(const Duration(days: 1))) {
     target.add(d.toIso8601String().substring(0, 10));
@@ -302,6 +338,7 @@ Map<String, dynamic> _ensureContinuousDays(Map<String, dynamic> skel) {
     'days': outDays,
   };
 }
+
 
 /* ----------------------------- Enrichment core ---------------------------- */
 

@@ -303,7 +303,9 @@ class _LoginPageState extends State<LoginPage> {
               SizedBox(
                 height: 65,
                 child: ElevatedButton(
-                  onPressed: () {},
+                  onPressed: () {
+                    Navigator.pushNamed(context, '/home');
+                  },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: brand,
                     foregroundColor: Colors.white,
