@@ -1,10 +1,10 @@
-
 import 'dart:isolate';
 import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
 import 'package:smart_trip_planner_flutter/data/services/agent_isolate.dart';
 import 'package:smart_trip_planner_flutter/presentation/provider/connectivity_provider.dart';
+import 'package:smart_trip_planner_flutter/presentation/provider/usage_provider.dart';
 
 class AgentResult {
   AgentResult({required this.itinerary, required this.tokens, required this.aux});

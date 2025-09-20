@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:smart_trip_planner_flutter/data/local/local_store.dart';
 import 'package:smart_trip_planner_flutter/presentation/provider/connectivity_provider.dart';
 import 'package:smart_trip_planner_flutter/presentation/provider/agent_provider.dart';
+import 'package:smart_trip_planner_flutter/presentations/screens/profile_screen.dart';
 
 class AgentScreen extends ConsumerStatefulWidget {
   const AgentScreen({super.key});
@@ -52,13 +53,17 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
                 onPressed: () => ref.invalidate(agentStateProvider),
               )
             : null,
-        actions: const [
+        actions: [
           Padding(
-            padding: EdgeInsets.only(right: 12),
-            child: CircleAvatar(
-              radius: 18,
-              backgroundColor: Color(0xFF10B981),
-              child: Text('S', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
+            padding: const EdgeInsets.only(right: 12),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(20),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ProfileScreen())),
+              child: const CircleAvatar(
+                radius: 18,
+                backgroundColor: Color(0xFF10B981),
+                child: Text('S', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
+              ),
             ),
           ),
         ],
@@ -234,7 +239,7 @@ class _AgentScreenState extends ConsumerState<AgentScreen> {
   }
 }
 
-// Home screen (prompt) like mock
+// Home screen 
 class _HomePrompt extends StatelessWidget {
   const _HomePrompt({required this.controller, required this.onCreatePressed, required this.isOnline, required this.savedTrips, required this.onOpenSaved});
   final TextEditingController controller;
@@ -308,7 +313,7 @@ class _HomePrompt extends StatelessWidget {
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
         decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20), border: Border.all(color: const Color(0xFFE5E7EB))),
-        child: Row(children: [const Icon(Icons.circle, size: 10, color: Color(0xFF34D399)), const SizedBox(width: 8), Expanded(child: Text(text))]),
+        child: Row(children: [const Icon(Icons.circle, size: 10, color: Color(0xFF34D399)), const SizedBox(width: 8), Expanded(child: Text(text)),GestureDetector(child: Icon(Icons.delete))]),
       );
 }
 
