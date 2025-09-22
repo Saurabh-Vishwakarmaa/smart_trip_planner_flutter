@@ -199,32 +199,6 @@ speech_to_text: ^6.5.0
 - iOS: NSSpeechRecognitionUsageDescription + NSMicrophoneUsageDescription.
 - Use a single initialized SpeechService instance and call toggle() from the mic icon. Recognized text updates the same TextEditingController.
 
-### Text‑to‑Speech (optional)
-Dependency:
-```yaml
-flutter_tts: ^3.8.0
-```
-Quick service:
-```dart
-import 'package:flutter_tts/flutter_tts.dart';
-
-class TtsService {
-  final _tts = FlutterTts();
-  Future<void> init() async {
-    await _tts.setLanguage('en-US');
-    await _tts.setSpeechRate(0.45);
-    await _tts.setVolume(1.0);
-    await _tts.setPitch(1.0);
-  }
-  Future<void> speak(String text) => _tts.speak(text);
-  Future<void> stop() => _tts.stop();
-}
-```
-Usage:
-```dart
-final tts = TtsService()..init();
-ElevatedButton(onPressed: () => tts.speak(promptController.text), child: Text('Read Prompt'));
-```
 
 ---
 
@@ -252,8 +226,9 @@ lib/
 ---
 
 ## 7) Demo video
+```
 https://drive.google.com/drive/folders/13zQKTeOL4PlCxHis-DBSWeJ3uGHBZkDT?usp=sharing
-
+```
 
 ---
 
